@@ -35,6 +35,13 @@ app.use(
   })
 );
 
+app.get("/",(req,res)=>{
+    res.json({
+        success:true,
+        message:"Backend is running"
+    })
+})
+
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,
