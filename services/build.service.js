@@ -1,14 +1,70 @@
+
 const path = require("path");
 const fs = require("fs");
-const { spawn } = require("child_process");
+const crypto = require("crypto");
 
-const env = require("../config/env");
 const { ensureDir } = require("../utils/file.utils");
 
 const jobs = new Map();
 
+const BUILD_ENGINE_URL = (
+  process.env.BUILD_ENGINE_URL || ""
+).replace(/\/+$/, "");
+
+const BUILD_ENGINE_API_KEY =
+  process.env.BUILD_ENGINE_API_KEY || "";
+
+const POLL_INTERVAL = 3000;
+
+const OUTPUT_ROOT = path.resolve(
+  __dirname,
+  "..",
+  "storage",
+  "builds"
+);
+
+ensureDir(OUTPUT_ROOT);
+
+function getHeaders() {
+  return {
+    "x-api-key": BUILD_ENGINE_API_KEY,
+  };
+}
+
+function updateJob(job, updates) {
+  Object.assign(job, updates);
+}
+
+function getErrorMessage(data, fallback) {
+  return data?.error || data?.message || fallback;
+}
+
+async function readResponse(response) {
+  const text = await response.text();
+
+  let data = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { error: text };
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      getErrorMessage(
+        data,
+        `Build Engine returned HTTP ${response.status}`
+      )
+    );
+  }
+
+  return data;
+}
+
 /**
- * Create a new build job
+ * Create a remote build job.
+ * The frontend continues to use the backend build ID.
  */
 function createBuildJob({
   buildId,
@@ -16,8 +72,23 @@ function createBuildJob({
   appName,
   logoPath,
 }) {
+  if (!BUILD_ENGINE_URL) {
+    throw new Error(
+      "BUILD_ENGINE_URL is missing from backend environment."
+    );
+  }
+
+  if (!BUILD_ENGINE_API_KEY) {
+    throw new Error(
+      "BUILD_ENGINE_API_KEY is missing from backend environment."
+    );
+  }
+
+  const id = buildId || crypto.randomUUID();
+
   const job = {
-    id: buildId,
+    id,
+    buildId: id,
 
     websiteUrl,
     appName,
@@ -34,472 +105,345 @@ function createBuildJob({
     createdAt: new Date().toISOString(),
     startedAt: null,
     completedAt: null,
+
+    engineBuildId: null,
+    logs: "",
   };
 
-  jobs.set(buildId, job);
+  jobs.set(id, job);
 
   startBuild(job, logoPath).catch((error) => {
-    console.error("\n========================================");
-    console.error("BUILD JOB FAILED");
-    console.error("========================================");
-    console.error(error);
+    console.error("REMOTE BUILD FAILED:", error);
 
-    job.status = "failed";
-    job.error = error.message || "Unknown build error";
-    job.message = "Build failed";
-    job.completedAt = new Date().toISOString();
+    updateJob(job, {
+      status: "failed",
+      error: error.message || "Unknown build error",
+      message: "Build failed",
+      completedAt: new Date().toISOString(),
+    });
   });
 
   return job;
 }
 
 /**
- * Start Build Engine
+ * Submit the build request to the remote Build Engine.
  */
 async function startBuild(job, logoPath) {
-  job.status = "building";
-  job.progress = 5;
-  job.message = "Starting Android build";
-  job.startedAt = new Date().toISOString();
+  updateJob(job, {
+    status: "queued",
+    progress: 2,
+    message: "Connecting to Build Engine",
+  });
 
-  const buildEngineRoot = path.resolve(
-    env.BUILD_ENGINE_ROOT
-  );
+  const form = new FormData();
 
-  ensureDir(buildEngineRoot);
+  form.append("url", job.websiteUrl);
+  form.append("appName", job.appName);
 
-  const outputDir = path.join(
-    buildEngineRoot,
-    "output"
-  );
+  if (logoPath) {
+    const absoluteLogoPath = path.resolve(logoPath);
 
-  ensureDir(outputDir);
-
-  /*
-   * IMPORTANT
-   * On Windows use npm.cmd instead of npm.
-   */
-  const npmCommand =
-    process.platform === "win32"
-      ? "npm.cmd"
-      : "npm";
-
-  /*
-   * Make sure logo path is absolute.
-   */
-  const absoluteLogoPath = logoPath
-    ? path.resolve(logoPath)
-    : path.join(
-        buildEngineRoot,
-        "input",
-        "logo.png"
-      );
-
-  console.log("\n========================================");
-  console.log(" STARTING BUILD ENGINE");
-  console.log("========================================");
-  console.log("Build ID :", job.id);
-  console.log("Website  :", job.websiteUrl);
-  console.log("App Name :", job.appName);
-  console.log("Logo     :", absoluteLogoPath);
-  console.log("Engine   :", buildEngineRoot);
-  console.log("========================================\n");
-
-  /*
-   * Check logo
-   */
-  if (!fs.existsSync(absoluteLogoPath)) {
-    throw new Error(
-      `Logo file not found: ${absoluteLogoPath}`
-    );
-  }
-
-  /*
-   * Build Engine arguments
-   */
-  const args = [
-    "run",
-    "build",
-    "--",
-    "--url",
-    job.websiteUrl,
-    "--name",
-    job.appName,
-    "--logo",
-    absoluteLogoPath,
-  ];
-
-  /*
-   * Run Build Engine
-   */
-  await runCommand(
-    npmCommand,
-    args,
-    buildEngineRoot,
-    job
-  );
-
-  /*
-   * Generate slug exactly like Build Engine
-   */
-  const slug = String(job.appName)
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  /*
-   * Expected output files
-   */
-  const apkPath = path.join(
-    outputDir,
-    `${slug}-debug.apk`
-  );
-
-  const aabPath = path.join(
-    outputDir,
-    `${slug}.aab`
-  );
-
-  console.log("\n========================================");
-  console.log(" CHECKING BUILD OUTPUT");
-  console.log("========================================");
-  console.log("APK:", apkPath);
-  console.log("AAB:", aabPath);
-
-  /*
-   * APK check
-   */
-  if (!fs.existsSync(apkPath)) {
-    console.error("APK NOT FOUND");
-
-    /*
-     * Try to find APK automatically.
-     */
-    const foundApk = findFile(
-      outputDir,
-      ".apk",
-      slug
+    await fs.promises.access(
+      absoluteLogoPath,
+      fs.constants.R_OK
     );
 
-    if (foundApk) {
-      job.apk = foundApk;
-    } else {
-      throw new Error(
-        `APK build completed but APK file was not found.\nExpected: ${apkPath}`
-      );
-    }
-  } else {
-    job.apk = apkPath;
-  }
-
-  /*
-   * AAB check
-   */
-  if (!fs.existsSync(aabPath)) {
-    console.error("AAB NOT FOUND");
-
-    /*
-     * Try to find AAB automatically.
-     */
-    const foundAab = findFile(
-      outputDir,
-      ".aab",
-      slug
+    const logoBuffer = await fs.promises.readFile(
+      absoluteLogoPath
     );
 
-    if (foundAab) {
-      job.aab = foundAab;
-    } else {
-      throw new Error(
-        `AAB build completed but AAB file was not found.\nExpected: ${aabPath}`
-      );
-    }
-  } else {
-    job.aab = aabPath;
-  }
+    const extension = path.extname(
+      absoluteLogoPath
+    ).toLowerCase();
 
-  console.log("\nAPK:", job.apk);
-  console.log("AAB:", job.aab);
-
-  /*
-   * Build completed
-   */
-  job.status = "completed";
-  job.progress = 100;
-  job.message = "Build completed successfully";
-  job.completedAt = new Date().toISOString();
-
-  console.log("\n========================================");
-  console.log(" BUILD JOB COMPLETED");
-  console.log("========================================\n");
-}
-
-/**
- * Execute command
- */
-function runCommand(command, args, cwd, job) {
-  return new Promise((resolve, reject) => {
-    console.log("\n========================================");
-    console.log(" RUNNING BUILD ENGINE");
-    console.log("========================================");
-
-    console.log(
-      `${command} ${args
-        .map((arg) =>
-          arg.includes(" ")
-            ? `"${arg}"`
-            : arg
-        )
-        .join(" ")}`
-    );
-
-    console.log("CWD:", cwd);
-
-    const childEnv = {
-      ...process.env,
-
-      JAVA_HOME:
-        process.env.JAVA_HOME ||
-        "C:\\Program Files\\Java\\jdk-24",
-
-      ANDROID_SDK_ROOT:
-        process.env.ANDROID_SDK_ROOT ||
-        "C:\\Users\\ACER\\AppData\\Local\\Android\\Sdk",
-
-      ANDROID_HOME:
-        process.env.ANDROID_HOME ||
-        "C:\\Users\\ACER\\AppData\\Local\\Android\\Sdk",
+    const mimeTypes = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".webp": "image/webp",
     };
 
-    /*
-     * Windows par npm.cmd use karo
-     */
-    const executable =
-      process.platform === "win32"
-        ? "npm.cmd"
-        : "npm";
+    const mimeType = mimeTypes[extension];
 
-    const child = spawn(
-      executable,
-      args,
-      {
-        cwd,
-        shell: true,
-        windowsHide: true,
-        env: childEnv,
-      }
-    );
-
-    let output = "";
-    let errorOutput = "";
-
-    child.stdout.on("data", (data) => {
-      const text = data.toString();
-
-      output += text;
-
-      process.stdout.write(text);
-
-      updateProgress(job, text);
-    });
-
-    child.stderr.on("data", (data) => {
-      const text = data.toString();
-
-      errorOutput += text;
-      output += text;
-
-      process.stderr.write(text);
-
-      updateProgress(job, text);
-    });
-
-    child.on("error", (error) => {
-      console.error(
-        "\nSpawn Error:",
-        error
+    if (!mimeType) {
+      throw new Error(
+        "Logo must be PNG, JPG, JPEG, or WEBP."
       );
-
-      reject(
-        new Error(
-          `Build Engine could not start: ${error.message}`
-        )
-      );
-    });
-
-    child.on("close", (code) => {
-      console.log(
-        `\nBuild Engine exited with code ${code}`
-      );
-
-      if (code === 0) {
-        resolve(output);
-        return;
-      }
-
-      const combinedOutput =
-        `${output}\n${errorOutput}`.trim();
-
-      const lastOutput =
-        combinedOutput.length > 5000
-          ? combinedOutput.slice(-5000)
-          : combinedOutput;
-
-      reject(
-        new Error(
-          `Build process exited with code ${code}\n\n${lastOutput}`
-        )
-      );
-    });
-  });
-}
-
-/**
- * Update job progress based on Build Engine output
- */
-function updateProgress(job, output) {
-  const text = String(output)
-    .toLowerCase();
-
-  if (text.includes("[1/6]")) {
-    job.progress = 10;
-    job.message =
-      "Creating Android project";
-  }
-
-  if (text.includes("[2/6]")) {
-    job.progress = 25;
-    job.message =
-      "Configuring Android app";
-  }
-
-  if (text.includes("[3/6]")) {
-    job.progress = 40;
-    job.message =
-      "Generating app icon";
-  }
-
-  if (text.includes("[4/6]")) {
-    job.progress = 55;
-    job.message =
-      "Building APK";
-  }
-
-  if (text.includes("[5/6]")) {
-    job.progress = 80;
-    job.message =
-      "Building AAB";
-  }
-
-  if (text.includes("[6/6]")) {
-    job.progress = 95;
-    job.message =
-      "Finalizing build";
-  }
-
-  if (
-    text.includes("apk build success")
-  ) {
-    job.progress = 70;
-    job.message = "APK generated";
-  }
-
-  if (
-    text.includes("aab build success")
-  ) {
-    job.progress = 95;
-    job.message = "AAB generated";
-  }
-
-  if (
-    text.includes("build successful")
-  ) {
-    if (job.progress < 95) {
-      job.progress = 90;
     }
-  }
-}
 
-/**
- * Find generated APK/AAB automatically
- */
-function findFile(
-  directory,
-  extension,
-  slug
-) {
-  if (!fs.existsSync(directory)) {
-    return null;
+    form.append(
+      "logo",
+      new Blob([logoBuffer], { type: mimeType }),
+      path.basename(absoluteLogoPath)
+    );
   }
 
-  const files = fs.readdirSync(
-    directory,
+  console.log("Submitting remote build:", {
+    buildId: job.id,
+    websiteUrl: job.websiteUrl,
+    appName: job.appName,
+    engineUrl: BUILD_ENGINE_URL,
+    hasLogo: Boolean(logoPath),
+  });
+
+  const response = await fetch(
+    `${BUILD_ENGINE_URL}/api/builds`,
     {
-      withFileTypes: true,
+      method: "POST",
+      headers: getHeaders(),
+      body: form,
+      signal: AbortSignal.timeout(120000),
     }
   );
 
-  /*
-   * First look for exact slug match
-   */
-  for (const file of files) {
-    if (!file.isFile()) {
-      continue;
-    }
+  const result = await readResponse(response);
 
-    const name =
-      file.name.toLowerCase();
-
-    if (
-      name.endsWith(extension) &&
-      name.includes(slug)
-    ) {
-      return path.join(
-        directory,
-        file.name
-      );
-    }
+  if (!result.buildId) {
+    throw new Error(
+      "Build Engine did not return a build ID."
+    );
   }
 
-  /*
-   * Then fallback to any matching extension
-   */
-  for (const file of files) {
-    if (!file.isFile()) {
-      continue;
-    }
+  job.engineBuildId = result.buildId;
 
-    const name =
-      file.name.toLowerCase();
+  updateJob(job, {
+    status: result.status || "queued",
+    progress: result.status === "building" ? 5 : 2,
+    message: "Build request accepted",
+    startedAt:
+      result.status === "building"
+        ? new Date().toISOString()
+        : null,
+  });
 
-    if (
-      name.endsWith(extension)
-    ) {
-      return path.join(
-        directory,
-        file.name
-      );
-    }
-  }
-
-  return null;
+  await monitorBuild(job);
 }
 
 /**
- * Get one build
+ * Poll remote build status until completed or failed.
+ */
+async function monitorBuild(job) {
+  while (
+    job.status !== "completed" &&
+    job.status !== "failed"
+  ) {
+    const response = await fetch(
+      `${BUILD_ENGINE_URL}/api/builds/${encodeURIComponent(
+        job.engineBuildId
+      )}`,
+      {
+        method: "GET",
+        headers: getHeaders(),
+        signal: AbortSignal.timeout(30000),
+      }
+    );
+
+    const result = await readResponse(response);
+
+    job.logs = result.logs || job.logs;
+
+    if (result.status === "queued") {
+      updateJob(job, {
+        status: "queued",
+        progress: Math.max(job.progress, 2),
+        message: "Waiting for build slot",
+      });
+    } else if (result.status === "building") {
+      updateJob(job, {
+        status: "building",
+        progress: Math.max(
+          job.progress,
+          Math.min(result.progress || 5, 95)
+        ),
+        message: getBuildMessage(
+          result.progress || 5
+        ),
+        startedAt:
+          job.startedAt ||
+          result.startedAt ||
+          new Date().toISOString(),
+      });
+    } else if (result.status === "failed") {
+      throw new Error(
+        result.error ||
+          "The remote Android build failed."
+      );
+    } else if (result.status === "completed") {
+      updateJob(job, {
+        status: "building",
+        progress: 96,
+        message: "Downloading generated APK and AAB",
+      });
+
+      await downloadArtifacts(job, result.files || []);
+
+      updateJob(job, {
+        status: "completed",
+        progress: 100,
+        message: "Build completed successfully",
+        completedAt: new Date().toISOString(),
+      });
+
+      return;
+    } else {
+      throw new Error(
+        `Unknown Build Engine status: ${result.status}`
+      );
+    }
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, POLL_INTERVAL)
+    );
+  }
+}
+
+function getBuildMessage(progress) {
+  if (progress < 15) return "Creating Android project";
+  if (progress < 35) return "Configuring Android app";
+  if (progress < 50) return "Generating app icon";
+  if (progress < 75) return "Building APK";
+  if (progress < 95) return "Building AAB";
+
+  return "Finalizing build";
+}
+
+/**
+ * Download the artifacts from Build Engine to backend storage.
+ * Existing backend download routes can continue using local paths.
+ */
+async function downloadArtifacts(job, files) {
+  const apkName = files.find(
+    (file) => /\.apk$/i.test(file)
+  );
+
+  const aabName = files.find(
+    (file) => /\.aab$/i.test(file)
+  );
+
+  if (!apkName && !aabName) {
+    throw new Error(
+      "Build completed, but no APK or AAB was returned."
+    );
+  }
+
+  const jobOutputDir = path.join(
+    OUTPUT_ROOT,
+    job.id
+  );
+
+  await fs.promises.mkdir(jobOutputDir, {
+    recursive: true,
+  });
+
+  if (apkName) {
+    job.apk = await downloadArtifact(
+      job.engineBuildId,
+      apkName,
+      jobOutputDir
+    );
+  }
+
+  if (aabName) {
+    job.aab = await downloadArtifact(
+      job.engineBuildId,
+      aabName,
+      jobOutputDir
+    );
+  }
+
+  if (!job.apk && !job.aab) {
+    throw new Error(
+      "Unable to download the generated build files."
+    );
+  }
+}
+
+async function downloadArtifact(
+  engineBuildId,
+  filename,
+  outputDir
+) {
+  // Only permit APK/AAB filenames, never arbitrary paths.
+  const safeFilename = path.basename(filename);
+
+  if (
+    safeFilename !== filename ||
+    !/\.(apk|aab)$/i.test(safeFilename)
+  ) {
+    throw new Error("Invalid build artifact filename.");
+  }
+
+  const url =
+    `${BUILD_ENGINE_URL}/api/builds/` +
+    `${encodeURIComponent(engineBuildId)}/download/` +
+    `${encodeURIComponent(safeFilename)}`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: getHeaders(),
+    signal: AbortSignal.timeout(300000),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(
+      `Could not download ${safeFilename}: ` +
+      `${response.status} ${errorText}`
+    );
+  }
+
+  const destination = path.join(
+    outputDir,
+    safeFilename
+  );
+
+  const temporaryPath = `${destination}.part`;
+
+  try {
+    const buffer = Buffer.from(
+      await response.arrayBuffer()
+    );
+
+    if (buffer.length === 0) {
+      throw new Error(
+        `Downloaded artifact is empty: ${safeFilename}`
+      );
+    }
+
+    await fs.promises.writeFile(
+      temporaryPath,
+      buffer
+    );
+
+    await fs.promises.rename(
+      temporaryPath,
+      destination
+    );
+
+    return destination;
+  } catch (error) {
+    await fs.promises
+      .unlink(temporaryPath)
+      .catch(() => {});
+
+    throw error;
+  }
+}
+
+/**
+ * Get one build.
  */
 function getBuildJob(buildId) {
   return jobs.get(buildId) || null;
 }
 
 /**
- * Get all builds
+ * Get all builds.
  */
 function getAllBuilds() {
-  return Array.from(
-    jobs.values()
-  ).sort(
+  return Array.from(jobs.values()).sort(
     (a, b) =>
       new Date(b.createdAt) -
       new Date(a.createdAt)
