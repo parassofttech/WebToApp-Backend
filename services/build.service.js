@@ -188,7 +188,7 @@ async function startBuild(job, logoPath) {
   });
 
   console.log("[BUILD DEBUG] Starting remote build");
-console.log("[BUILD DEBUG] Engine URL:", engineUrl);
+console.log("[BUILD DEBUG] Engine URL:", BUILD_ENGINE_URL);
 console.log("[BUILD DEBUG] API key present:", Boolean(
   process.env.BUILD_ENGINE_API_KEY
 ));
