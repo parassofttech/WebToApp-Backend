@@ -234,18 +234,47 @@ async function monitorBuild(job) {
     job.status !== "completed" &&
     job.status !== "failed"
   ) {
-    const response = await fetch(
-      `${BUILD_ENGINE_URL}/api/builds/${encodeURIComponent(
-        job.engineBuildId
-      )}`,
-      {
-        method: "GET",
-        headers: getHeaders(),
-        signal: AbortSignal.timeout(30000),
-      }
-    );
+   
+console.log("[BUILD DEBUG] Checking remote status:", {
+  engineBuildId: job.engineBuildId,
+  url: `${BUILD_ENGINE_URL}/api/builds/${encodeURIComponent(
+    job.engineBuildId
+  )}`,
+});
 
-    const result = await readResponse(response);
+let response;
+
+try {
+  response = await fetch(
+    `${BUILD_ENGINE_URL}/api/builds/${encodeURIComponent(
+      job.engineBuildId
+    )}`,
+    {
+      method: "GET",
+      headers: getHeaders(),
+      signal: AbortSignal.timeout(60000),
+    }
+  );
+} catch (error) {
+  console.error("[BUILD DEBUG] Status request failed:", {
+    name: error.name,
+    message: error.message,
+    engineBuildId: job.engineBuildId,
+  });
+
+  throw error;
+}
+
+console.log(
+  "[BUILD DEBUG] Remote status HTTP:",
+  response.status
+);
+
+const result = await readResponse(response);
+console.log("[BUILD DEBUG] Remote build status:", result.status);
+
+
+  
 
     job.logs = result.logs || job.logs;
 
