@@ -187,6 +187,12 @@ async function startBuild(job, logoPath) {
     hasLogo: Boolean(logoPath),
   });
 
+  console.log("[BUILD DEBUG] Starting remote build");
+console.log("[BUILD DEBUG] Engine URL:", engineUrl);
+console.log("[BUILD DEBUG] API key present:", Boolean(
+  process.env.BUILD_ENGINE_API_KEY
+));
+
   const response = await fetch(
     `${BUILD_ENGINE_URL}/api/builds`,
     {
