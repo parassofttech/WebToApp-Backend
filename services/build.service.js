@@ -39,7 +39,11 @@ function getErrorMessage(data, fallback) {
   return data?.error || data?.message || fallback;
 }
 
+
 async function readResponse(response) {
+  const contentType =
+    response.headers.get("content-type") || "unknown";
+
   const text = await response.text();
 
   let data = {};
@@ -47,20 +51,39 @@ async function readResponse(response) {
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    data = { error: text };
+    data = {};
   }
 
   if (!response.ok) {
+    const details =
+      data.error ||
+      data.message ||
+      text.replace(/<[^>]*>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim() ||
+      "Empty response";
+
     throw new Error(
-      getErrorMessage(
-        data,
-        `Build Engine returned HTTP ${response.status}`
-      )
+      `Build Engine HTTP ${response.status} ` +
+      `(${contentType}): ${details.slice(0, 700)}`
+    );
+  }
+
+  if (
+    contentType.includes("text/html") ||
+    contentType.includes("text/plain")
+  ) {
+    throw new Error(
+      `Build Engine returned a non-JSON response. ` +
+      `HTTP ${response.status}; ` +
+      `Content-Type: ${contentType}; ` +
+      `Response: ${text.slice(0, 300)}`
     );
   }
 
   return data;
 }
+
 
 /**
  * Create a remote build job.
@@ -187,13 +210,18 @@ async function startBuild(job, logoPath) {
     hasLogo: Boolean(logoPath),
   });
 
-  console.log("[BUILD DEBUG] Starting remote build");
-console.log("[BUILD DEBUG] Engine URL:", BUILD_ENGINE_URL);
-console.log("[BUILD DEBUG] API key present:", Boolean(
-  process.env.BUILD_ENGINE_API_KEY
-));
+  
+console.log("[BUILD DEBUG] Sending POST request", {
+  engineUrl: BUILD_ENGINE_URL,
+  buildId: job.id,
+  hasApiKey: Boolean(BUILD_ENGINE_API_KEY),
+  hasLogo: Boolean(logoPath),
+});
 
-  const response = await fetch(
+let response;
+
+try {
+  response = await fetch(
     `${BUILD_ENGINE_URL}/api/builds`,
     {
       method: "POST",
@@ -203,7 +231,27 @@ console.log("[BUILD DEBUG] API key present:", Boolean(
     }
   );
 
-  const result = await readResponse(response);
+  console.log("[BUILD DEBUG] POST response received", {
+    status: response.status,
+    contentType: response.headers.get("content-type"),
+  });
+} catch (error) {
+  console.error("[BUILD DEBUG] POST request failed", {
+    name: error.name,
+    message: error.message,
+    cause: error.cause?.message,
+  });
+
+  throw error;
+}
+
+const result = await readResponse(response);
+
+console.log("[BUILD DEBUG] Build accepted", {
+  buildId: result.buildId,
+  status: result.status,
+});
+
 
   if (!result.buildId) {
     throw new Error(
